@@ -834,6 +834,8 @@ impl KspContext {
             }
             SolverType::Fgmres => {
                 let mut s = FgmresSolver::new(self.rtol, self.maxits, self.restart);
+                s.atol = self.atol;
+                s.dtol = self.dtol;
                 self.apply_fgmres_pending_to(&mut s);
                 Some(Box::new(s))
             }
@@ -5140,6 +5142,23 @@ mod tests {
 
         ksp.try_set_pc_side(PcSide::Right).unwrap();
         assert_eq!(ksp.effective_pc_side(), PcSide::Right);
+    }
+
+    #[test]
+    fn fgmres_receives_all_context_tolerances() {
+        let mut ksp = KspContext::new();
+        ksp.set_tolerances(2.0e-13, 3.0e-30, 4.0e6, 321);
+        ksp.set_type(SolverType::Fgmres).unwrap();
+
+        let solver = ksp
+            .solver
+            .as_mut()
+            .and_then(|solver| solver.as_any_mut().downcast_mut::<FgmresSolver>())
+            .expect("FGMRES solver");
+        assert_eq!(solver.rtol, 2.0e-13);
+        assert_eq!(solver.atol, 3.0e-30);
+        assert_eq!(solver.dtol, 4.0e6);
+        assert_eq!(solver.maxits, 321);
     }
 
     #[test]
