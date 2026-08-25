@@ -429,7 +429,7 @@ fn check_r() {
 }
 ";
 
-const RESIDENT_BATCH_SIZE: usize = 16;
+const RESIDENT_BATCH_SIZE: usize = 8;
 const RESIDENT_STATE_LEN: usize = 16;
 
 struct ResidentPipelines {
