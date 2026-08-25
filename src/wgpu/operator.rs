@@ -140,6 +140,23 @@ impl WgpuCsrOp {
     }
 
     pub(crate) fn apply(&self, x: &WgpuVector, y: &WgpuVector) -> Result<(), KError> {
+        let mut encoder =
+            self.runtime
+                .device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("kryst WebGPU CSR SpMV"),
+                });
+        self.encode_apply(&mut encoder, x, y)?;
+        self.runtime.queue().submit([encoder.finish()]);
+        Ok(())
+    }
+
+    pub(crate) fn encode_apply(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        x: &WgpuVector,
+        y: &WgpuVector,
+    ) -> Result<(), KError> {
         if x.len() != self.ncols || y.len() != self.nrows {
             return Err(KError::InvalidInput(format!(
                 "WebGPU CSR product requires x={}, y={}; got x={}, y={}",
@@ -185,12 +202,6 @@ impl WgpuCsrOp {
                     },
                 ],
             });
-        let mut encoder =
-            self.runtime
-                .device()
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("kryst WebGPU CSR SpMV"),
-                });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("kryst WebGPU CSR SpMV"),
@@ -206,7 +217,6 @@ impl WgpuCsrOp {
                 1,
             );
         }
-        self.runtime.queue().submit([encoder.finish()]);
         Ok(())
     }
 }

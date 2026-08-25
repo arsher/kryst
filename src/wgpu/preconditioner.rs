@@ -76,7 +76,12 @@ impl WgpuJacobi {
         })
     }
 
-    pub(crate) fn apply(&self, x: &WgpuVector, y: &WgpuVector) -> Result<(), KError> {
+    pub(crate) fn encode_apply(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        x: &WgpuVector,
+        y: &WgpuVector,
+    ) -> Result<(), KError> {
         if x.len() != self.n || y.len() != self.n {
             return Err(KError::InvalidInput(format!(
                 "WebGPU Jacobi requires vectors of length {}; got {} and {}",
@@ -113,12 +118,6 @@ impl WgpuJacobi {
                     },
                 ],
             });
-        let mut encoder =
-            self.runtime
-                .device()
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("kryst WebGPU Jacobi"),
-                });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("kryst WebGPU Jacobi"),
@@ -134,6 +133,17 @@ impl WgpuJacobi {
                 1,
             );
         }
+        Ok(())
+    }
+
+    pub(crate) fn apply(&self, x: &WgpuVector, y: &WgpuVector) -> Result<(), KError> {
+        let mut encoder =
+            self.runtime
+                .device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("kryst WebGPU Jacobi"),
+                });
+        self.encode_apply(&mut encoder, x, y)?;
         self.runtime.queue().submit([encoder.finish()]);
         Ok(())
     }
