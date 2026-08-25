@@ -17,6 +17,19 @@ fn apply(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 ";
 
+/// Caller-owned preconditioner operating entirely on resident WebGPU vectors.
+///
+/// Implementations may submit one or more command buffers from [`Self::apply`], but must not map
+/// or read back the vectors. Queue ordering makes the result visible to the following resident
+/// Krylov kernel.
+pub trait WgpuPreconditioner: Send + Sync {
+    /// Square dimensions of the approximate inverse.
+    fn dims(&self) -> (usize, usize);
+
+    /// Apply the approximate inverse, writing all output entries.
+    fn apply(&self, input: &WgpuVector, output: &WgpuVector) -> Result<(), KError>;
+}
+
 pub(crate) struct WgpuJacobi {
     runtime: Arc<WgpuRuntime>,
     inverse_diagonal: wgpu::Buffer,

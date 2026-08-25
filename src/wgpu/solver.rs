@@ -611,6 +611,7 @@ pub struct WgpuKspContext {
     operator: Option<Arc<WgpuCsrOp>>,
     pc_type: PcType,
     preconditioner: Option<WgpuPreconditioner>,
+    custom_preconditioner: Option<Box<dyn super::preconditioner::WgpuPreconditioner>>,
     convergence: Convergence,
     workspace: Option<BiCgStabWorkspace>,
     vector_pipeline: wgpu::ComputePipeline,
@@ -736,6 +737,7 @@ impl WgpuKspContext {
             operator: None,
             pc_type: PcType::None,
             preconditioner: None,
+            custom_preconditioner: None,
             convergence: Convergence::new(1.0e-5, 1.0e-30, 1.0e5, 10_000),
             workspace: None,
             vector_pipeline,
@@ -767,9 +769,24 @@ impl WgpuKspContext {
             ));
         }
         self.pc_type = pc_type;
+        self.custom_preconditioner = None;
         self.preconditioner = None;
         self.workspace = None;
         Ok(self)
+    }
+
+    /// Install a caller-owned resident WebGPU preconditioner.
+    ///
+    /// The object is retained across repeated solves and operator-value updates. Its dimensions
+    /// are checked against the registered operator during setup.
+    pub fn set_preconditioner(
+        &mut self,
+        preconditioner: Box<dyn super::preconditioner::WgpuPreconditioner>,
+    ) -> &mut Self {
+        self.custom_preconditioner = Some(preconditioner);
+        self.preconditioner = None;
+        self.workspace = None;
+        self
     }
 
     /// Set the single square CSR operator used for both the equation and
@@ -824,7 +841,14 @@ impl WgpuKspContext {
             .as_ref()
             .ok_or_else(|| KError::InvalidInput("WebGPU operator is not set".into()))?;
         let n = operator.dims().0;
-        if self.preconditioner.is_none() {
+        if let Some(preconditioner) = &self.custom_preconditioner {
+            if preconditioner.dims() != (n, n) {
+                return Err(KError::InvalidInput(format!(
+                    "custom WebGPU preconditioner dimensions {:?} do not match operator dimensions ({n}, {n})",
+                    preconditioner.dims()
+                )));
+            }
+        } else if self.preconditioner.is_none() {
             self.preconditioner = Some(match self.pc_type {
                 PcType::None => WgpuPreconditioner::None,
                 PcType::Jacobi => WgpuPreconditioner::Jacobi(WgpuJacobi::from_csr(operator)?),
@@ -1027,6 +1051,9 @@ impl WgpuKspContext {
     }
 
     fn apply_preconditioner(&self, x: &WgpuVector, y: &WgpuVector) -> Result<(), KError> {
+        if let Some(preconditioner) = &self.custom_preconditioner {
+            return preconditioner.apply(x, y);
+        }
         match self
             .preconditioner
             .as_ref()
@@ -1044,6 +1071,11 @@ impl WgpuKspContext {
         x: &WgpuVector,
         y: &WgpuVector,
     ) -> Result<(), KError> {
+        if self.custom_preconditioner.is_some() {
+            return Err(KError::Unsupported(
+                "custom WebGPU preconditioners submit their own command buffers",
+            ));
+        }
         match self
             .preconditioner
             .as_ref()

@@ -87,12 +87,16 @@ impl WgpuVector {
             .collect())
     }
 
-    pub(crate) fn runtime(&self) -> &Arc<WgpuRuntime> {
-        &self.runtime
+    /// Storage buffer used by this vector for feature-specific kernel composition.
+    ///
+    /// The buffer remains owned by the vector and must only be used with [`Self::runtime`].
+    pub fn buffer(&self) -> &wgpu::Buffer {
+        &self.buffer
     }
 
-    pub(crate) fn buffer(&self) -> &wgpu::Buffer {
-        &self.buffer
+    /// Runtime that owns this vector.
+    pub fn runtime(&self) -> &Arc<WgpuRuntime> {
+        &self.runtime
     }
 
     pub(crate) fn byte_len(&self) -> u64 {

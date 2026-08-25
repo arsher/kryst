@@ -60,11 +60,15 @@ impl WgpuRuntime {
         &self.adapter_name
     }
 
-    pub(crate) fn device(&self) -> &wgpu::Device {
+    /// Underlying device for composing feature-specific kernels with Kryst's resident vectors.
+    ///
+    /// Buffers passed back into Kryst must have been created from this exact runtime.
+    pub fn device(&self) -> &wgpu::Device {
         &self.device
     }
 
-    pub(crate) fn queue(&self) -> &wgpu::Queue {
+    /// Underlying queue for composing feature-specific kernels with a Kryst solve.
+    pub fn queue(&self) -> &wgpu::Queue {
         &self.queue
     }
 

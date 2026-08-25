@@ -14,6 +14,7 @@ mod solver;
 mod vector;
 
 pub use operator::WgpuCsrOp;
+pub use preconditioner::WgpuPreconditioner;
 pub use runtime::WgpuRuntime;
 pub use solver::WgpuKspContext;
 pub use vector::WgpuVector;
