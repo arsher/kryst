@@ -416,7 +416,7 @@ fn check_r() {
     if (state.running < 0.5f) {
         return;
     }
-    state.residual_squared = reduction[0].x;
+    state.residual_squared = reduction[0].y;
     state.rho_previous = state.rho;
     let reason = norm_reason(state.residual_squared);
     if (reason != CONTINUED) {
@@ -1581,7 +1581,9 @@ fn checked_norm(value: f64, context: &'static str) -> Result<f64, KError> {
         });
     }
     if value < 0.0 {
-        return Err(KError::BreakdownOrIndefinite);
+        return Err(KError::SolveError(format!(
+            "{context} squared norm is negative ({value:e})"
+        )));
     }
     Ok(value.sqrt())
 }
