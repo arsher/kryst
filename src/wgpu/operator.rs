@@ -151,7 +151,17 @@ impl WgpuCsrOp {
         Ok(())
     }
 
-    pub(crate) fn encode_apply(
+    /// Encode one sparse matrix-vector product into a caller-owned command encoder.
+    ///
+    /// The command is not submitted by this method. This allows preconditioners and other
+    /// resident GPU algorithms to compose the product with additional kernels without inserting
+    /// a host synchronization point.
+    ///
+    /// # Errors
+    ///
+    /// Returns an input error when vector dimensions differ from the operator, or a device error
+    /// when either vector belongs to another WebGPU runtime.
+    pub fn encode_apply(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         x: &WgpuVector,
