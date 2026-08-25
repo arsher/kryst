@@ -4407,9 +4407,15 @@ impl KspContext {
         self.monitors.clear();
     }
 
-    #[cfg(test)]
+    /// Install a caller-owned preconditioner implementation.
+    ///
+    /// This is the programmatic counterpart to selecting a built-in [`PcType`]. The context owns
+    /// the object and runs its ordinary setup lifecycle against the registered operator.
     pub fn set_preconditioner(&mut self, pc: Box<dyn Preconditioner>) {
         self.pc = Some(pc);
+        self.pc_spec = None;
+        self.pending_pc = None;
+        self.pc_chain_plan = None;
         self.invalidate_pc_setup();
     }
 
