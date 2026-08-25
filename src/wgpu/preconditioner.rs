@@ -19,15 +19,36 @@ fn apply(@builtin(global_invocation_id) id: vec3<u32>) {
 
 /// Caller-owned preconditioner operating entirely on resident WebGPU vectors.
 ///
-/// Implementations may submit one or more command buffers from [`Self::apply`], but must not map
-/// or read back the vectors. Queue ordering makes the result visible to the following resident
-/// Krylov kernel.
+/// Implementations encode their kernels into a caller-owned command buffer and must not map or
+/// read back the vectors. This allows Kryst to keep Krylov iterations in one ordered GPU batch.
 pub trait WgpuPreconditioner: Send + Sync {
     /// Square dimensions of the approximate inverse.
     fn dims(&self) -> (usize, usize);
 
-    /// Apply the approximate inverse, writing all output entries.
-    fn apply(&self, input: &WgpuVector, output: &WgpuVector) -> Result<(), KError>;
+    /// Encode the approximate inverse into a caller-owned command buffer.
+    ///
+    /// Implementations must write all output entries and must not submit the encoder themselves.
+    /// This lets the Krylov implementation fuse the preconditioner with adjacent resident kernels.
+    fn encode_apply(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        input: &WgpuVector,
+        output: &WgpuVector,
+    ) -> Result<(), KError>;
+
+    /// Apply the approximate inverse as one standalone submission.
+    fn apply(&self, input: &WgpuVector, output: &WgpuVector) -> Result<(), KError> {
+        let mut encoder =
+            input
+                .runtime()
+                .device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("caller-owned WebGPU preconditioner"),
+                });
+        self.encode_apply(&mut encoder, input, output)?;
+        input.runtime().queue().submit([encoder.finish()]);
+        Ok(())
+    }
 }
 
 pub(crate) struct WgpuJacobi {
@@ -146,18 +167,6 @@ impl WgpuJacobi {
                 1,
             );
         }
-        Ok(())
-    }
-
-    pub(crate) fn apply(&self, x: &WgpuVector, y: &WgpuVector) -> Result<(), KError> {
-        let mut encoder =
-            self.runtime
-                .device()
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("kryst WebGPU Jacobi"),
-                });
-        self.encode_apply(&mut encoder, x, y)?;
-        self.runtime.queue().submit([encoder.finish()]);
         Ok(())
     }
 }

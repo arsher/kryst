@@ -1,6 +1,6 @@
 use super::operator::WgpuCsrOp;
 use super::preconditioner::WgpuJacobi;
-use super::runtime::{WgpuRuntime, encode_u32};
+use super::runtime::{WgpuRuntime, encode_f32, encode_u32};
 use super::vector::WgpuVector;
 use crate::context::ksp_context::SolverType;
 use crate::context::pc_context::PcType;
@@ -226,7 +226,7 @@ const DIVERGED_INF: f32 = 7.0f;
 const MIN_NORMAL: f32 = 1.17549435e-38f;
 
 @group(0) @binding(0) var<storage, read_write> state: SolverState;
-@group(0) @binding(1) var<storage, read> reduction: array<vec2<f32>>;
+@group(0) @binding(1) var<storage, read> reduction: array<vec4<f32>>;
 
 fn invalid_reason(value: f32) -> f32 {
     let bits = bitcast<u32>(value);
@@ -388,8 +388,8 @@ fn finish_omega() {
     if (state.running < 0.5f) {
         return;
     }
-    let t_dot_t = reduction[0].x;
-    let t_dot_s = reduction[0].y;
+    let t_dot_t = reduction[0].y;
+    let t_dot_s = reduction[0].z;
     let invalid_tt = invalid_reason(t_dot_t);
     let invalid_ts = invalid_reason(t_dot_s);
     if (invalid_tt != CONTINUED || invalid_ts != CONTINUED) {
@@ -429,7 +429,9 @@ fn check_r() {
 }
 ";
 
-#[allow(dead_code)]
+const RESIDENT_BATCH_SIZE: usize = 8;
+const RESIDENT_STATE_LEN: usize = 16;
+
 struct ResidentPipelines {
     vector_layout: wgpu::BindGroupLayout,
     update_p_omega: wgpu::ComputePipeline,
@@ -446,7 +448,6 @@ struct ResidentPipelines {
     check_r: wgpu::ComputePipeline,
 }
 
-#[allow(dead_code)]
 impl ResidentPipelines {
     fn new(runtime: &WgpuRuntime) -> Self {
         let storage = |binding, read_only| wgpu::BindGroupLayoutEntry {
@@ -568,6 +569,7 @@ struct BiCgStabWorkspace {
     z_s: WgpuVector,
     ax: WgpuVector,
     reduction: ReductionWorkspace,
+    state: wgpu::Buffer,
 }
 
 impl BiCgStabWorkspace {
@@ -596,6 +598,10 @@ impl BiCgStabWorkspace {
                 ),
                 partial_count,
             },
+            state: runtime.create_empty_storage_buffer(
+                "kryst resident BiCGSTAB state",
+                16 * std::mem::size_of::<f32>() as u64,
+            ),
         })
     }
 }
@@ -620,8 +626,7 @@ pub struct WgpuKspContext {
     reduction_final_pipeline: wgpu::ComputePipeline,
     reduction_bind_group_layout: wgpu::BindGroupLayout,
     reduction_params: wgpu::Buffer,
-    #[allow(dead_code)]
-    resident: Option<ResidentPipelines>,
+    resident: ResidentPipelines,
 }
 
 impl std::fmt::Debug for WgpuKspContext {
@@ -732,6 +737,7 @@ impl WgpuKspContext {
                 });
         let reduction_params =
             runtime.create_uniform_buffer("kryst WebGPU reduction parameters", &[0; 16]);
+        let resident = ResidentPipelines::new(&runtime);
         Self {
             runtime,
             operator: None,
@@ -746,7 +752,7 @@ impl WgpuKspContext {
             reduction_final_pipeline,
             reduction_bind_group_layout,
             reduction_params,
-            resident: None,
+            resident,
         }
     }
 
@@ -865,9 +871,9 @@ impl WgpuKspContext {
         Ok(self)
     }
 
-    /// Solve one device-resident system. Matrix and Krylov vectors stay on the
-    /// selected GPU; each convergence reduction returns only two `f32`
-    /// scalars to the host controller.
+    /// Solve one device-resident system. Matrix, Krylov vectors, scalar recurrence state, and
+    /// convergence decisions stay on the selected GPU. The host reads the compact solver state
+    /// once per bounded batch and performs one explicit true-residual check at the end.
     pub async fn solve(
         &mut self,
         b: &WgpuVector,
@@ -932,6 +938,7 @@ impl WgpuKspContext {
             z_s,
             ax,
             reduction,
+            state,
             ..
         } = workspace;
 
@@ -956,68 +963,79 @@ impl WgpuKspContext {
             return Ok(initial_stats.finalize_reason_counters());
         }
 
-        let mut rho = initial[1];
-        let mut rho_previous = 1.0;
-        let mut alpha = 1.0;
-        let mut omega = 1.0;
-        let mut iterations = 0usize;
-        let mut final_reason = ConvergedReason::DivergedMaxIts;
+        self.initialize_resident_state(state, initial[0], initial[1])?;
+        self.prepare_reduction(reduction, r.len())?;
 
-        for iteration in 1..=self.convergence.max_iters {
-            ensure_nonzero_finite(rho, "WebGPU BiCGStab rho")?;
-            if iteration > 1 {
-                let beta = (rho / rho_previous) * (alpha / omega);
-                ensure_finite(beta, "WebGPU BiCGStab beta")?;
-                self.axpby(-omega, v, 1.0, p)?;
-                self.axpby(1.0, r, beta, p)?;
-            }
-
-            self.apply_preconditioner(p, z_p)?;
-            operator.apply(z_p, v)?;
-            let alpha_denominator = self.dot2(r_hat, v, r_hat, v, reduction).await?[0];
-            reductions += 1;
-            ensure_nonzero_finite(alpha_denominator, "WebGPU BiCGStab alpha denominator")?;
-            alpha = rho / alpha_denominator;
-            ensure_nonzero_finite(alpha, "WebGPU BiCGStab alpha")?;
-
-            self.copy(r, s)?;
-            self.axpby(-alpha, v, 1.0, s)?;
-            self.apply_preconditioner(s, z_s)?;
-            operator.apply(z_s, t)?;
-            let omega_terms = self.dot3(s, s, t, t, t, s, reduction).await?;
-            reductions += 1;
-            let s_norm =
-                checked_norm(omega_terms[0], "WebGPU BiCGStab intermediate residual norm")?;
-            let (s_reason, _) = self.convergence.check(s_norm, bnorm, iteration);
-            if s_reason != ConvergedReason::Continued {
-                self.axpby(alpha, z_p, 1.0, x)?;
-                iterations = iteration;
-                rnorm = s_norm;
-                final_reason = s_reason;
+        let mut state_snapshot = vec![0.0_f32; RESIDENT_STATE_LEN];
+        let mut batch_readbacks = 0usize;
+        loop {
+            let completed = state_snapshot[13].max(0.0).round() as usize;
+            let batch_size = self
+                .convergence
+                .max_iters
+                .saturating_sub(completed)
+                .min(RESIDENT_BATCH_SIZE);
+            if batch_size == 0 {
                 break;
             }
-            if !omega_terms[1].is_finite() || omega_terms[1] <= 0.0 {
-                return Err(KError::BreakdownOrIndefinite);
+            let mut encoder =
+                self.runtime
+                    .device()
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("kryst resident BiCGSTAB batch"),
+                    });
+            for _ in 0..batch_size {
+                self.encode_resident_iteration(
+                    &mut encoder,
+                    operator,
+                    state,
+                    x,
+                    r,
+                    r_hat,
+                    p,
+                    v,
+                    s,
+                    t,
+                    z_p,
+                    z_s,
+                    reduction,
+                )?;
             }
-            omega = omega_terms[2] / omega_terms[1];
-            ensure_nonzero_finite(omega, "WebGPU BiCGStab omega")?;
-
-            self.axpby(alpha, z_p, 1.0, x)?;
-            self.axpby(omega, z_s, 1.0, x)?;
-            self.copy(s, r)?;
-            self.axpby(-omega, t, 1.0, r)?;
-            let next = self.dot2(r_hat, r, r, r, reduction).await?;
-            reductions += 1;
-            rnorm = checked_norm(next[1], "WebGPU BiCGStab residual norm")?;
-            iterations = iteration;
-            let (reason, _) = self.convergence.check(rnorm, bnorm, iteration);
-            if reason != ConvergedReason::Continued {
-                final_reason = reason;
+            self.runtime.queue().submit([encoder.finish()]);
+            state_snapshot = self
+                .runtime
+                .read_f32(
+                    state,
+                    RESIDENT_STATE_LEN,
+                    "read resident BiCGSTAB batch state",
+                )
+                .await?;
+            batch_readbacks += 1;
+            if state_snapshot.iter().any(|value| !value.is_finite()) {
+                return Err(KError::NonFiniteReduction {
+                    kind: if state_snapshot.iter().any(|value| value.is_nan()) {
+                        crate::error::NonFiniteKind::Nan
+                    } else {
+                        crate::error::NonFiniteKind::Inf
+                    },
+                    context: "resident WebGPU BiCGSTAB state",
+                });
+            }
+            if state_snapshot[12] < 0.5 {
                 break;
             }
-            rho_previous = rho;
-            rho = next[0];
         }
+
+        let iterations = state_snapshot[13].max(0.0).round() as usize;
+        let mut final_reason = resident_reason(state_snapshot[14]);
+        if final_reason == ConvergedReason::Continued {
+            final_reason = ConvergedReason::DivergedMaxIts;
+        }
+        rnorm = checked_norm(
+            f64::from(state_snapshot[8]),
+            "resident WebGPU BiCGStab residual norm",
+        )?;
+        reductions += 3usize.saturating_mul(iterations);
 
         operator.apply(x, ax)?;
         self.copy(b, r)?;
@@ -1041,40 +1059,129 @@ impl WgpuKspContext {
             ..SolverCounters::default()
         };
         stats.reduction_model = Some(ReductionModel {
-            variant: "wgpu-three-reduction-bicgstab",
+            variant: "wgpu-resident-batched-three-reduction-bicgstab",
             startup: 1,
             per_iteration: 3.0,
             tail: 1,
         });
-        stats.effective_variant = Some("wgpu-f64-controlled-right-bicgstab".into());
+        stats.effective_variant = Some(format!(
+            "wgpu-resident-right-bicgstab-batch-{RESIDENT_BATCH_SIZE}-readbacks-{batch_readbacks}"
+        ));
         Ok(stats.finalize_reason_counters())
     }
 
-    fn apply_preconditioner(&self, x: &WgpuVector, y: &WgpuVector) -> Result<(), KError> {
-        if let Some(preconditioner) = &self.custom_preconditioner {
-            return preconditioner.apply(x, y);
-        }
-        match self
-            .preconditioner
-            .as_ref()
-            .expect("setup checked preconditioner")
-        {
-            WgpuPreconditioner::None => self.copy(x, y),
-            WgpuPreconditioner::Jacobi(jacobi) => jacobi.apply(x, y),
-        }
+    #[allow(clippy::too_many_arguments)]
+    fn encode_resident_iteration(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        operator: &WgpuCsrOp,
+        state: &wgpu::Buffer,
+        x: &WgpuVector,
+        r: &WgpuVector,
+        r_hat: &WgpuVector,
+        p: &WgpuVector,
+        v: &WgpuVector,
+        s: &WgpuVector,
+        t: &WgpuVector,
+        z_p: &WgpuVector,
+        z_s: &WgpuVector,
+        reduction: &ReductionWorkspace,
+    ) -> Result<(), KError> {
+        self.encode_dot3(encoder, r_hat, r, r, r, r, r, reduction)?;
+        self.encode_scalar(encoder, &self.resident.begin_iteration, state, reduction);
+        self.encode_vector(encoder, &self.resident.update_p_omega, state, r, p, v)?;
+        self.encode_vector(encoder, &self.resident.prepare_p, state, r, p, v)?;
+        self.encode_preconditioner(encoder, p, z_p)?;
+        operator.encode_apply(encoder, z_p, v)?;
+        self.encode_dot3(encoder, r_hat, v, r_hat, v, r_hat, v, reduction)?;
+        self.encode_scalar(encoder, &self.resident.finish_alpha, state, reduction);
+        self.encode_vector(encoder, &self.resident.make_s, state, r, s, v)?;
+        self.encode_vector(encoder, &self.resident.update_x_alpha, state, z_p, x, t)?;
+        self.encode_preconditioner(encoder, s, z_s)?;
+        operator.encode_apply(encoder, z_s, t)?;
+        self.encode_dot3(encoder, s, s, t, t, t, s, reduction)?;
+        self.encode_scalar(encoder, &self.resident.check_s, state, reduction);
+        self.encode_scalar(encoder, &self.resident.finish_omega, state, reduction);
+        self.encode_vector(encoder, &self.resident.update_x_omega, state, z_s, x, t)?;
+        self.encode_vector(encoder, &self.resident.make_r, state, s, r, t)?;
+        self.encode_dot3(encoder, r_hat, r, r, r, r, r, reduction)?;
+        self.encode_scalar(encoder, &self.resident.check_r, state, reduction);
+        Ok(())
     }
 
-    #[allow(dead_code)]
+    fn initialize_resident_state(
+        &self,
+        state: &wgpu::Buffer,
+        bnorm_squared: f64,
+        residual_squared: f64,
+    ) -> Result<(), KError> {
+        const MAX_EXACT_F32_INTEGER: usize = 1 << 24;
+        if self.convergence.max_iters > MAX_EXACT_F32_INTEGER {
+            return Err(KError::InvalidInput(format!(
+                "WebGPU resident iteration limit {} exceeds exact f32 control range",
+                self.convergence.max_iters
+            )));
+        }
+        let rtol_squared = (self.convergence.rtol * self.convergence.rtol) as f32;
+        let atol_squared = (self.convergence.atol * self.convergence.atol) as f32;
+        let dtol_squared = (self.convergence.dtol * self.convergence.dtol) as f32;
+        if !rtol_squared.is_finite() || !atol_squared.is_finite() || !dtol_squared.is_finite() {
+            return Err(KError::InvalidInput(
+                "WebGPU squared solver tolerances exceed portable f32 range".into(),
+            ));
+        }
+        let values = [
+            residual_squared as f32,
+            residual_squared as f32,
+            1.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            bnorm_squared as f32,
+            residual_squared as f32,
+            rtol_squared,
+            atol_squared,
+            dtol_squared,
+            1.0,
+            0.0,
+            0.0,
+            self.convergence.max_iters as f32,
+        ];
+        if values.iter().any(|value| !value.is_finite()) {
+            return Err(KError::InvalidInput(
+                "WebGPU resident solver state exceeds portable f32 range".into(),
+            ));
+        }
+        self.runtime
+            .queue()
+            .write_buffer(state, 0, &encode_f32(values));
+        Ok(())
+    }
+
+    fn prepare_reduction(&self, reduction: &ReductionWorkspace, n: usize) -> Result<(), KError> {
+        let params = encode_u32([
+            u32::try_from(n)
+                .map_err(|_| KError::InvalidInput("WebGPU vector length exceeds u32".into()))?,
+            u32::try_from(reduction.partial_count)
+                .map_err(|_| KError::InvalidInput("WebGPU reduction count exceeds u32".into()))?,
+            0,
+            0,
+        ]);
+        self.runtime
+            .queue()
+            .write_buffer(&self.reduction_params, 0, &params);
+        Ok(())
+    }
+
     fn encode_preconditioner(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         x: &WgpuVector,
         y: &WgpuVector,
     ) -> Result<(), KError> {
-        if self.custom_preconditioner.is_some() {
-            return Err(KError::Unsupported(
-                "custom WebGPU preconditioners submit their own command buffers",
-            ));
+        if let Some(preconditioner) = &self.custom_preconditioner {
+            return preconditioner.encode_apply(encoder, x, y);
         }
         match self
             .preconditioner
@@ -1090,7 +1197,6 @@ impl WgpuKspContext {
         }
     }
 
-    #[allow(dead_code)]
     fn encode_vector(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -1107,11 +1213,7 @@ impl WgpuKspContext {
             .device()
             .create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("kryst resident BiCGSTAB vector operation"),
-                layout: &self
-                    .resident
-                    .as_ref()
-                    .expect("resident kernels are initialized")
-                    .vector_layout,
+                layout: &self.resident.vector_layout,
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
@@ -1147,7 +1249,6 @@ impl WgpuKspContext {
         Ok(())
     }
 
-    #[allow(dead_code)]
     fn encode_scalar(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -1160,11 +1261,7 @@ impl WgpuKspContext {
             .device()
             .create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("kryst resident BiCGSTAB scalar operation"),
-                layout: &self
-                    .resident
-                    .as_ref()
-                    .expect("resident kernels are initialized")
-                    .scalar_layout,
+                layout: &self.resident.scalar_layout,
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
@@ -1185,19 +1282,23 @@ impl WgpuKspContext {
         pass.dispatch_workgroups(1, 1, 1);
     }
 
-    #[allow(dead_code)]
-    fn encode_dot2(
+    #[allow(clippy::too_many_arguments)]
+    fn encode_dot3(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         x0: &WgpuVector,
         y0: &WgpuVector,
         x1: &WgpuVector,
         y1: &WgpuVector,
+        x2: &WgpuVector,
+        y2: &WgpuVector,
         reduction: &ReductionWorkspace,
     ) -> Result<(), KError> {
         x0.ensure_compatible(y0)?;
         x0.ensure_compatible(x1)?;
         x0.ensure_compatible(y1)?;
+        x0.ensure_compatible(x2)?;
+        x0.ensure_compatible(y2)?;
         let bind_group = self
             .runtime
             .device()
@@ -1235,11 +1336,11 @@ impl WgpuKspContext {
                     },
                     wgpu::BindGroupEntry {
                         binding: 7,
-                        resource: x1.buffer().as_entire_binding(),
+                        resource: x2.buffer().as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 8,
-                        resource: y1.buffer().as_entire_binding(),
+                        resource: y2.buffer().as_entire_binding(),
                     },
                 ],
             });
@@ -1485,29 +1586,6 @@ fn checked_norm(value: f64, context: &'static str) -> Result<f64, KError> {
     Ok(value.sqrt())
 }
 
-fn ensure_nonzero_finite(value: f64, context: &'static str) -> Result<(), KError> {
-    ensure_finite(value, context)?;
-    if value.abs() <= f64::from(f32::MIN_POSITIVE) {
-        return Err(KError::SolveError(format!("{context} is zero")));
-    }
-    Ok(())
-}
-
-fn ensure_finite(value: f64, context: &'static str) -> Result<(), KError> {
-    if !value.is_finite() {
-        return Err(KError::NonFiniteReduction {
-            kind: if value.is_nan() {
-                crate::error::NonFiniteKind::Nan
-            } else {
-                crate::error::NonFiniteKind::Inf
-            },
-            context,
-        });
-    }
-    Ok(())
-}
-
-#[allow(dead_code)]
 fn resident_reason(code: f32) -> ConvergedReason {
     match code.round() as i32 {
         1 => ConvergedReason::ConvergedRtol,

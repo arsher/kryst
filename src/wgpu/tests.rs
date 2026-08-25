@@ -13,7 +13,12 @@ impl WgpuPreconditioner for CopyPreconditioner {
         (self.dimension, self.dimension)
     }
 
-    fn apply(&self, input: &WgpuVector, output: &WgpuVector) -> Result<(), crate::KError> {
+    fn encode_apply(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        input: &WgpuVector,
+        output: &WgpuVector,
+    ) -> Result<(), crate::KError> {
         if !Arc::ptr_eq(&self.runtime, input.runtime())
             || !Arc::ptr_eq(&self.runtime, output.runtime())
             || input.len() != self.dimension
@@ -25,14 +30,7 @@ impl WgpuPreconditioner for CopyPreconditioner {
         }
         let bytes = u64::try_from(self.dimension * std::mem::size_of::<f32>())
             .expect("test dimension fits u64");
-        let mut encoder =
-            self.runtime
-                .device()
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("test caller-owned WebGPU preconditioner"),
-                });
         encoder.copy_buffer_to_buffer(input.buffer(), 0, output.buffer(), 0, bytes);
-        self.runtime.queue().submit([encoder.finish()]);
         Ok(())
     }
 }
