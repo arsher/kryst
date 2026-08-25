@@ -23,6 +23,17 @@ pub enum CudaErrorKind {
     DeviceMismatch,
 }
 
+/// Broad category for a WebGPU failure without exposing `wgpu` in kryst's
+/// public error API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WgpuErrorKind {
+    Unavailable,
+    Allocation,
+    Kernel,
+    Synchronization,
+    DeviceMismatch,
+}
+
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
 pub enum KError {
     #[error("help requested")]
@@ -65,6 +76,12 @@ pub enum KError {
     #[error("CUDA {kind:?} error during {operation}: {message}")]
     Cuda {
         kind: CudaErrorKind,
+        operation: &'static str,
+        message: String,
+    },
+    #[error("WebGPU {kind:?} error during {operation}: {message}")]
+    Wgpu {
+        kind: WgpuErrorKind,
         operation: &'static str,
         message: String,
     },

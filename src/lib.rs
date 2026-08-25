@@ -93,6 +93,9 @@ pub mod parallel;
 pub mod preconditioner;
 pub mod solver;
 pub mod utils;
+#[cfg(all(feature = "wgpu", not(feature = "complex")))]
+#[cfg_attr(docsrs, doc(cfg(feature = "wgpu")))]
+pub mod wgpu;
 
 #[doc(hidden)]
 pub mod ops;
